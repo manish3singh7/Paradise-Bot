@@ -2,7 +2,6 @@ import asyncio
 import json
 import urllib.parse
 import urllib.request
-import vlc
 import yt_dlp
 from highrise import BaseBot, Position, User, AnchorPosition
 from highrise.models import SessionMetadata
@@ -31,23 +30,17 @@ class AdvanceHighriseBot(BaseBot):
         self.user_positions = {}
 
         # ==========================
-        # 2. AUDIO & MEDIA ENGINE
+        # 2. CLOUD QUEUE ENGINE
         # ==========================
-        self.vlc_instance = vlc.Instance("--no-xlib")
-        self.player = self.vlc_instance.media_player_new()
-
-        # 24/7 Background station when queue is idle
-        self.idle_radio_url = "https://stream.zeno.fm/f3wvbbqmdg8uv"
-        self.is_idle_radio = False
-
         self.music_queue = []
         self.current_track = None
         self.is_playing = False
         self.volume = 80
         self.skip_votes = set()
         self.required_skips = 3
+        self.playback_task = None
 
-        # Cloud-safe: prioritize SoundCloud to bypass YouTube datacenter IP throttling
+        # yt-dlp metadata options (fast extraction, no audio downloading)
         self.ydl_opts = {
             'format': 'bestaudio/best',
             'noplaylist': True,
@@ -72,11 +65,6 @@ class AdvanceHighriseBot(BaseBot):
             except Exception as e:
                 print(f"Failed to place bot on start: {e}")
 
-        # Start background monitor for auto-progressing finished tracks
-        asyncio.create_task(self._track_monitor())
-
-        # Start 24/7 background ambient stream
-        await self._start_idle_radio()
         await self.highrise.chat("⚡ Highrise Advanced Controller Online. Type !help for commands.")
 
     async def on_user_join(self, user: User, position: Position | AnchorPosition) -> None:
@@ -127,7 +115,7 @@ class AdvanceHighriseBot(BaseBot):
         elif cmd in ["!q", "!queue"]:
             await self.cmd_view_queue()
 
-        # Admin Self-Verification
+        # Admin Verification
         elif cmd == "!claimadmin":
             await self.cmd_claim_admin(user, args)
 
@@ -150,24 +138,11 @@ class AdvanceHighriseBot(BaseBot):
             await self.cmd_set_volume(user, args)
 
     # ==========================
-    # MUSIC PLAYBACK & STREAMING
+    # CLOUD DJ QUEUE & METADATA
     # ==========================
 
-    async def _track_monitor(self) -> None:
-        """Asynchronous monitor that advances queue automatically when a song finishes."""
-        while True:
-            try:
-                # If a user song is playing and has naturally finished
-                if self.is_playing and not self.is_idle_radio:
-                    state = self.player.get_state()
-                    if state == vlc.State.Ended:
-                        await self._play_next_track()
-            except Exception as e:
-                print(f"Track monitor exception: {e}")
-            await asyncio.sleep(1)
-
     def _resolve_spotify_or_query(self, query: str) -> str:
-        """Decodes Spotify links to track titles without needing API credentials."""
+        """Resolves Spotify track links into track titles via public oEmbed."""
         if "open.spotify.com/track" in query:
             try:
                 encoded = urllib.parse.quote(query)
@@ -180,11 +155,11 @@ class AdvanceHighriseBot(BaseBot):
                         data = json.loads(response.read().decode('utf-8'))
                         return data.get("title", query)
             except Exception as e:
-                print(f"Spotify resolver fallback: {e}")
+                print(f"Spotify resolver error: {e}")
         return query
 
-    def _extract_audio_stream(self, query: str):
-        """Extracts direct playable stream URL using yt-dlp (SoundCloud default)."""
+    def _fetch_track_info(self, query: str):
+        """Extracts track title and duration using yt-dlp."""
         is_direct_url = query.startswith("http://") or query.startswith("https://")
         target = query if is_direct_url else f"scsearch1:{query}"
 
@@ -192,59 +167,55 @@ class AdvanceHighriseBot(BaseBot):
             info = ydl.extract_info(target, download=False)
             if 'entries' in info and len(info['entries']) > 0:
                 entry = info['entries'][0]
-                return entry['url'], entry.get('title', query)
-            return info['url'], info.get('title', query)
-
-    async def _start_idle_radio(self) -> None:
-        """Starts background 24/7 radio when queue is idle."""
-        try:
-            self.player.stop()
-            media = self.vlc_instance.media_new(self.idle_radio_url)
-            self.player.set_media(media)
-            self.player.audio_set_volume(self.volume)
-            self.player.play()
-            self.is_playing = True
-            self.is_idle_radio = True
-            self.current_track = {"title": "24/7 Lo-Fi Chill Radio", "requested_by": "Room Radio"}
-        except Exception as e:
-            print(f"Error starting idle radio: {e}")
+                return entry.get('title', query), entry.get('duration', 180)
+            return info.get('title', query), info.get('duration', 180)
 
     async def _play_next_track(self) -> None:
-        """Loads and streams the next track in queue or falls back to idle radio."""
-        if self.player.is_playing():
-            self.player.stop()
+        """Advances the queue and tracks song playback duration."""
+        if self.playback_task and not self.playback_task.done():
+            self.playback_task.cancel()
 
         if not self.music_queue:
             self.current_track = None
-            await self._start_idle_radio()
-            await self.highrise.chat("📻 Queue empty. Switched to 24/7 Lo-Fi background radio.")
+            self.is_playing = False
+            await self.highrise.chat("⏹️ DJ Queue is empty. Use !play <song> to queue music.")
             return
 
         self.current_track = self.music_queue.pop(0)
         self.is_playing = True
-        self.is_idle_radio = False
         self.skip_votes.clear()
 
         query = self.current_track["query"]
-        await self.highrise.chat(f"🔍 Loading track: '{query}'...")
+        await self.highrise.chat(f"🔍 Fetching track: '{query}'...")
 
         loop = asyncio.get_event_loop()
         try:
-            stream_url, real_title = await loop.run_in_executor(None, self._extract_audio_stream, query)
-            media = self.vlc_instance.media_new(stream_url)
-            self.player.set_media(media)
-            self.player.audio_set_volume(self.volume)
-            self.player.play()
-
+            real_title, duration = await loop.run_in_executor(None, self._fetch_track_info, query)
             self.current_track["title"] = real_title
-            await self.highrise.chat(f"🎶 Now Playing: '{real_title}' [Req by @{self.current_track['requested_by']}]")
+            self.current_track["duration"] = duration
+
+            mins, secs = divmod(duration, 60)
+            duration_str = f"{int(mins)}:{int(secs):02d}"
+
+            await self.highrise.chat(f"🎶 Now Playing: '{real_title}' ({duration_str}) [Req by @{self.current_track['requested_by']}]")
+
+            # Asynchronous timer for auto-advancing when song completes
+            self.playback_task = asyncio.create_task(self._track_timer(duration))
+
         except Exception as e:
-            await self.highrise.chat(f"❌ Failed to play '{query}': {e}")
+            await self.highrise.chat(f"❌ Could not load '{query}': {e}")
             await self._play_next_track()
+
+    async def _track_timer(self, duration: int) -> None:
+        try:
+            await asyncio.sleep(duration)
+            await self._play_next_track()
+        except asyncio.CancelledError:
+            pass
 
     async def cmd_request_song(self, user: User, args: list) -> None:
         if not args:
-            await self.highrise.chat(f"@{user.username} Usage: !play <song name, artist, or Spotify link>")
+            await self.highrise.chat(f"@{user.username} Usage: !play <song name or Spotify link>")
             return
 
         raw_query = " ".join(args).strip()
@@ -258,8 +229,7 @@ class AdvanceHighriseBot(BaseBot):
         }
         self.music_queue.append(track_data)
 
-        # If currently idle on the radio or stopped, play immediately
-        if not self.is_playing or self.is_idle_radio:
+        if not self.is_playing:
             await self._play_next_track()
         else:
             pos = len(self.music_queue)
@@ -270,13 +240,8 @@ class AdvanceHighriseBot(BaseBot):
             await self.highrise.chat("No track currently playing.")
             return
 
-        if self.is_idle_radio:
-            await self.highrise.chat("Currently streaming live background radio. Use !play to queue a song.")
-            return
-
         if is_admin:
             await self.highrise.chat(f"⏭️ Admin @{user.username} forced skip.")
-            self.player.stop()
             await self._play_next_track()
             return
 
@@ -284,22 +249,19 @@ class AdvanceHighriseBot(BaseBot):
         votes = len(self.skip_votes)
         if votes >= self.required_skips:
             await self.highrise.chat(f"⏭️ Vote skip passed ({votes}/{self.required_skips}). Skipping...")
-            self.player.stop()
             await self._play_next_track()
         else:
             await self.highrise.chat(f"🗳️ Skip vote added: ({votes}/{self.required_skips}) votes required.")
 
     async def cmd_now_playing(self) -> None:
         if self.is_playing and self.current_track:
-            mode = "Radio Stream" if self.is_idle_radio else f"Req by @{self.current_track['requested_by']}"
-            await self.highrise.chat(f"🔊 Now Playing: '{self.current_track['title']}' [{mode}] | Vol: {self.volume}%")
+            await self.highrise.chat(f"🔊 Now Playing: '{self.current_track['title']}' [Req by @{self.current_track['requested_by']}] | Vol: {self.volume}%")
         else:
-            await self.highrise.chat("No track currently playing.")
+            await self.highrise.chat("No track currently playing. Use !play <song> to queue one.")
 
     async def cmd_view_queue(self) -> None:
         if not self.music_queue:
-            status = "Playing 24/7 background Lo-Fi" if self.is_idle_radio else "Idle"
-            await self.highrise.chat(f"📭 Queue is empty. ({status})")
+            await self.highrise.chat("📭 The DJ queue is currently empty.")
             return
 
         lines = [f"{idx+1}. {item['title']} (@{item['requested_by']})" for idx, item in enumerate(self.music_queue[:5])]
@@ -314,8 +276,7 @@ class AdvanceHighriseBot(BaseBot):
             await self.highrise.chat("Usage: !volume <0-100>")
             return
         self.volume = max(0, min(100, int(args[0])))
-        self.player.audio_set_volume(self.volume)
-        await self.highrise.chat(f"🎚️ Master Volume set to {self.volume}%.")
+        await self.highrise.chat(f"🎚️ DJ Master Volume set to {self.volume}%.")
 
     # ==========================
     # DYNAMIC ADMIN SYSTEM
@@ -328,7 +289,7 @@ class AdvanceHighriseBot(BaseBot):
 
         if args[0] == self.admin_passphrase:
             self.super_admins.add(user.username.lower())
-            await self.highrise.chat(f"👑 @{user.username} has been granted Super Admin status!")
+            await self.highrise.chat(f"👑 @{user.username} has verified credentials and is now a Super Admin!")
         else:
             await self.highrise.chat(f"@{user.username} Invalid passphrase.")
 
