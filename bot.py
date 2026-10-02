@@ -17,11 +17,7 @@ class AdvanceHighriseBot(BaseBot):
         # ==========================
         # 1. ACCESS CONTROL & ADMINS
         # ==========================
-       # Change this:
-        # self.super_admins = {"your_highrise_username".lower()}
-
-        # To your actual Highrise username (in lowercase):
-        self.super_admins = {"JustManish".lower()}
+        self.super_admins = {"your_highrise_username".lower()}
         self.admin_passphrase = os.environ.get("ADMIN_PASSPHRASE", "mySecretAdminPass123")
 
         # Bot self-state
@@ -199,6 +195,8 @@ class AdvanceHighriseBot(BaseBot):
             await self.cmd_claim_admin(user, args)
 
         # Admin Management & Controls
+        elif cmd in ["!setbotspot", "!botspot"] and is_admin:
+            await self.cmd_change_bot_default_spot(user, args)
         elif cmd in ["!addadmin", "!op"] and is_admin:
             await self.cmd_add_admin(user, args)
         elif cmd in ["!deladmin", "!deop"] and is_admin:
@@ -349,7 +347,7 @@ class AdvanceHighriseBot(BaseBot):
             await self.highrise.chat("Usage: !volume <0-100>")
             return
         self.volume = max(0, min(100, int(args[0])))
-        await self.highrise.chat(f"🎚️ DJ Master Volume set to {self.volume}%.")
+        await self.highrise.chat(f"🎚️️ DJ Master Volume set to {self.volume}%.")
 
     # ==========================
     # DYNAMIC ADMIN SYSTEM
@@ -390,12 +388,31 @@ class AdvanceHighriseBot(BaseBot):
         await self.highrise.chat(f"🛡️ Current Admins: {admin_list}")
 
     # ==========================
-    # BOT SELF-PLACEMENT SYSTEM
+    # BOT SPOT CONTROLS
     # ==========================
+
+    async def cmd_change_bot_default_spot(self, user: User, args: list) -> None:
+        """Sets the bot's default startup spawn location to an existing saved spot."""
+        if not args:
+            spots_list = ", ".join(self.saved_spots.keys())
+            await self.highrise.chat(f"@{user.username} Usage: !setbotspot <spot_name> (Available: {spots_list})")
+            return
+
+        spot_name = args[0].lower()
+
+        if spot_name not in self.saved_spots:
+            await self.highrise.chat(f"❌ Spot '{spot_name}' does not exist. Use !spots to view available spots or !setspot to create it.")
+            return
+
+        self.default_bot_spot = spot_name
+        self._save_config()
+
+        await self.highrise.teleport(self.bot_id, self.saved_spots[spot_name])
+        await self.highrise.chat(f"✅ Bot default spot updated to '{spot_name}' and teleported there!")
 
     async def cmd_bot_placement(self, user: User, args: list) -> None:
         if not args:
-            await self.highrise.chat(f"@{user.username} Usage: !bot tp <spot> | !bot walk <spot> | !bot come | !bot coords <x> <y> <z> [facing]")
+            await self.highrise.chat(f"@{user.username} Usage: !bot tp <spot> | !bot walk <spot> | !bot come | !bot coords <x> <y> <z> [facing] | !bot default <spot>")
             return
 
         subcmd = args[0].lower()
@@ -450,6 +467,7 @@ class AdvanceHighriseBot(BaseBot):
                 return
             self.default_bot_spot = args[1].lower()
             self._save_config()
+            await self.highrise.teleport(self.bot_id, self.saved_spots[self.default_bot_spot])
             await self.highrise.chat(f"✅ Bot startup spot set to '{self.default_bot_spot}'.")
 
     # ==========================
@@ -563,7 +581,7 @@ class AdvanceHighriseBot(BaseBot):
             "🎵 MUSIC: !play <song/link> | !skip | !np | !q",
             "📍 TELEPORT: !tp <spot/@user> | !spots",
             "👑 ACCESS: !claimadmin <passphrase> | !admins",
-            "🛡️ ADMIN: !bot <tp/walk/come/coords/default> | !bring | !send | !setspot | !delspot | !addadmin | !deladmin | !volume"
+            "🛡️ ADMIN: !setbotspot <spot> | !bot <tp/walk/come/coords/default> | !bring | !send | !setspot | !delspot | !addadmin | !deladmin | !volume"
         ]
         for line in bio_lines:
             await self.highrise.chat(line)
@@ -571,7 +589,7 @@ class AdvanceHighriseBot(BaseBot):
 
     async def cmd_help(self, user: User, is_admin: bool) -> None:
         general_commands = "!tp <spot/@user>, !spots, !admins, !play <song>, !skip, !np, !q, !bio"
-        admin_commands = " | Admin: !bot <tp/walk/come/coords/default>, !bring @user, !send @user <spot>, !setspot <name>, !delspot <name>, !addadmin @user, !deladmin @user, !volume <0-100>"
+        admin_commands = " | Admin: !setbotspot <spot>, !bot <tp/walk/come/coords/default>, !bring @user, !send @user <spot>, !setspot <name>, !delspot <name>, !addadmin @user, !deladmin @user, !volume <0-100>"
         await self.highrise.chat(f"Commands: {general_commands}" + (admin_commands if is_admin else ""))
 
 # ==========================
@@ -582,7 +600,6 @@ async def run_bot_loop():
     room_id = os.environ.get("ROOM_ID")
     api_token = os.environ.get("API_TOKEN")
 
-    # Command-line arguments fallback: python bot.py <room_id> <api_token>
     if not room_id and len(sys.argv) > 1:
         room_id = sys.argv[1]
     if not api_token and len(sys.argv) > 2:
