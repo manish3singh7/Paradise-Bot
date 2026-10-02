@@ -17,7 +17,11 @@ class AdvanceHighriseBot(BaseBot):
         # ==========================
         # 1. ACCESS CONTROL & ADMINS
         # ==========================
-        self.super_admins = {"your_highrise_username".lower()}
+       # Change this:
+        # self.super_admins = {"your_highrise_username".lower()}
+
+        # To your actual Highrise username (in lowercase):
+        self.super_admins = {"JustManish".lower()}
         self.admin_passphrase = os.environ.get("ADMIN_PASSPHRASE", "mySecretAdminPass123")
 
         # Bot self-state
