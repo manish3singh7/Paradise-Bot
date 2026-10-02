@@ -20,7 +20,7 @@ class AdvanceHighriseBot(BaseBot):
 
         # Bot self-state
         self.bot_id = None
-        self.default_bot_spot = "dj"
+        self.default_bot_spot = "bot"
 
         # Default Teleportation Coordinates
         self.saved_spots = {
@@ -28,7 +28,8 @@ class AdvanceHighriseBot(BaseBot):
             "vip": Position(5.0, 2.0, 8.0, "FrontLeft"),
             "stage": Position(12.0, 1.5, 12.0, "FrontRight"),
             "bar": Position(3.0, 0.0, 4.0, "FrontLeft"),
-            "jail": Position(0.0, 0.0, 0.0, "FrontRight")
+            "jail": Position(0.0, 0.0, 0.0, "FrontRight"),
+            "bot": Position(18.0,1.0,14.5 , "FrontLeft")
         }
         self.user_positions = {}
 
