@@ -1,3 +1,3 @@
 highrise-bot-sdk
-python-vlc
+
 yt-dlp
