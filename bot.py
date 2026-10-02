@@ -1,10 +1,13 @@
 import asyncio
 import json
+import os
 import urllib.parse
 import urllib.request
 import yt_dlp
 from highrise import BaseBot, Position, User, AnchorPosition
 from highrise.models import SessionMetadata
+
+CONFIG_FILE = "bot_config.json"
 
 class AdvanceHighriseBot(BaseBot):
     def __init__(self):
@@ -19,7 +22,7 @@ class AdvanceHighriseBot(BaseBot):
         self.bot_id = None
         self.default_bot_spot = "dj"
 
-        # Predefined Teleportation Coordinates
+        # Default Teleportation Coordinates
         self.saved_spots = {
             "dj": Position(10.5, 0.0, 10.5, "FrontRight"),
             "vip": Position(5.0, 2.0, 8.0, "FrontLeft"),
@@ -28,6 +31,9 @@ class AdvanceHighriseBot(BaseBot):
             "jail": Position(0.0, 0.0, 0.0, "FrontRight")
         }
         self.user_positions = {}
+
+        # Load persisted spots and admins from disk
+        self._load_config()
 
         # ==========================
         # 2. CLOUD QUEUE ENGINE
@@ -40,7 +46,6 @@ class AdvanceHighriseBot(BaseBot):
         self.required_skips = 3
         self.playback_task = None
 
-        # yt-dlp metadata options (fast extraction, no audio downloading)
         self.ydl_opts = {
             'format': 'bestaudio/best',
             'noplaylist': True,
@@ -50,6 +55,71 @@ class AdvanceHighriseBot(BaseBot):
         }
 
     # ==========================
+    # CONFIG PERSISTENCE
+    # ==========================
+
+    def _save_config(self) -> None:
+        """Saves dynamic spots, admins, and default bot location to disk."""
+        try:
+            data = {
+                "super_admins": list(self.super_admins),
+                "default_bot_spot": self.default_bot_spot,
+                "saved_spots": {
+                    name: {
+                        "x": pos.x,
+                        "y": pos.y,
+                        "z": pos.z,
+                        "facing": pos.facing
+                    } for name, pos in self.saved_spots.items()
+                }
+            }
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4)
+        except Exception as e:
+            print(f"Error saving config: {e}")
+
+    def _load_config(self) -> None:
+        """Loads saved spots and admins if the config file exists."""
+        if not os.path.exists(CONFIG_FILE):
+            return
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if "super_admins" in data:
+                    self.super_admins.update([a.lower() for a in data["super_admins"]])
+                if "default_bot_spot" in data:
+                    self.default_bot_spot = data["default_bot_spot"]
+                if "saved_spots" in data:
+                    for name, coords in data["saved_spots"].items():
+                        self.saved_spots[name] = Position(
+                            coords["x"], coords["y"], coords["z"], coords.get("facing", "FrontRight")
+                        )
+        except Exception as e:
+            print(f"Error loading config: {e}")
+
+    # ==========================
+    # COORDINATE RESOLVER
+    # ==========================
+
+    async def _get_user_position(self, user_id: str) -> Position | None:
+        """Retrieves user coordinates from cache or live room queries."""
+        if user_id in self.user_positions:
+            return self.user_positions[user_id]
+
+        try:
+            room_users = (await self.highrise.get_room_users()).content
+            for u, pos in room_users:
+                if u.id == user_id:
+                    if isinstance(pos, Position):
+                        self.user_positions[user_id] = pos
+                        return pos
+                    elif isinstance(pos, AnchorPosition):
+                        return None
+        except Exception as e:
+            print(f"Error retrieving position: {e}")
+        return None
+
+    # ==========================
     # LIFECYCLE EVENTS
     # ==========================
 
@@ -57,7 +127,6 @@ class AdvanceHighriseBot(BaseBot):
         self.bot_id = session_metadata.user_id
         print(f"Bot connected to room: {session_metadata.room_info.room_name} (ID: {self.bot_id})")
 
-        # Auto-place bot at its default home spot on boot
         if self.default_bot_spot in self.saved_spots:
             try:
                 await self.highrise.teleport(self.bot_id, self.saved_spots[self.default_bot_spot])
@@ -142,7 +211,6 @@ class AdvanceHighriseBot(BaseBot):
     # ==========================
 
     def _resolve_spotify_or_query(self, query: str) -> str:
-        """Resolves Spotify track links into track titles via public oEmbed."""
         if "open.spotify.com/track" in query:
             try:
                 encoded = urllib.parse.quote(query)
@@ -159,7 +227,6 @@ class AdvanceHighriseBot(BaseBot):
         return query
 
     def _fetch_track_info(self, query: str):
-        """Extracts track title and duration using yt-dlp."""
         is_direct_url = query.startswith("http://") or query.startswith("https://")
         target = query if is_direct_url else f"scsearch1:{query}"
 
@@ -171,7 +238,6 @@ class AdvanceHighriseBot(BaseBot):
             return info.get('title', query), info.get('duration', 180)
 
     async def _play_next_track(self) -> None:
-        """Advances the queue and tracks song playback duration."""
         if self.playback_task and not self.playback_task.done():
             self.playback_task.cancel()
 
@@ -198,10 +264,7 @@ class AdvanceHighriseBot(BaseBot):
             duration_str = f"{int(mins)}:{int(secs):02d}"
 
             await self.highrise.chat(f"🎶 Now Playing: '{real_title}' ({duration_str}) [Req by @{self.current_track['requested_by']}]")
-
-            # Asynchronous timer for auto-advancing when song completes
             self.playback_task = asyncio.create_task(self._track_timer(duration))
-
         except Exception as e:
             await self.highrise.chat(f"❌ Could not load '{query}': {e}")
             await self._play_next_track()
@@ -289,6 +352,7 @@ class AdvanceHighriseBot(BaseBot):
 
         if args[0] == self.admin_passphrase:
             self.super_admins.add(user.username.lower())
+            self._save_config()
             await self.highrise.chat(f"👑 @{user.username} has verified credentials and is now a Super Admin!")
         else:
             await self.highrise.chat(f"@{user.username} Invalid passphrase.")
@@ -299,6 +363,7 @@ class AdvanceHighriseBot(BaseBot):
             return
         target = args[0].lower().replace("@", "")
         self.super_admins.add(target)
+        self._save_config()
         await self.highrise.chat(f"✅ @{user.username} promoted @{target} to Admin!")
 
     async def cmd_del_admin(self, user: User, args: list) -> None:
@@ -307,6 +372,7 @@ class AdvanceHighriseBot(BaseBot):
             return
         target = args[0].lower().replace("@", "")
         self.super_admins.discard(target)
+        self._save_config()
         await self.highrise.chat(f"❌ Demoted @{target} from Admin.")
 
     async def cmd_list_admins(self) -> None:
@@ -347,13 +413,13 @@ class AdvanceHighriseBot(BaseBot):
                 await self.highrise.chat(f"Spot '{spot_name}' not found.")
 
         elif subcmd == "come":
-            admin_pos = self.user_positions.get(user.id)
+            admin_pos = await self._get_user_position(user.id)
             if admin_pos:
                 dest = Position(admin_pos.x + 0.5, admin_pos.y, admin_pos.z, admin_pos.facing)
                 await self.highrise.teleport(self.bot_id, dest)
                 await self.highrise.chat(f"🤖 Bot moved to @{user.username}.")
             else:
-                await self.highrise.chat("Could not detect your coordinates. Move slightly and retry.")
+                await self.highrise.chat("Could not detect your coordinates. Stand on the floor and retry.")
 
         elif subcmd in ["coords", "pos"]:
             if len(args) < 4:
@@ -373,6 +439,7 @@ class AdvanceHighriseBot(BaseBot):
                 await self.highrise.chat("Usage: !bot default <saved_spot>")
                 return
             self.default_bot_spot = args[1].lower()
+            self._save_config()
             await self.highrise.chat(f"✅ Bot startup spot set to '{self.default_bot_spot}'.")
 
     # ==========================
@@ -394,13 +461,15 @@ class AdvanceHighriseBot(BaseBot):
         room_users = (await self.highrise.get_room_users()).content
         target_user = next((u for u, _ in room_users if u.username.lower() == target_name), None)
 
-        if target_user and target_user.id in self.user_positions:
-            pos = self.user_positions[target_user.id]
-            dest = Position(pos.x + 0.5, pos.y, pos.z, pos.facing)
-            await self.highrise.teleport(user.id, dest)
-            await self.highrise.chat(f"⚡ @{user.username} warped to @{target_user.username}.")
-        else:
-            await self.highrise.chat(f"Destination or user '{target_name}' not found.")
+        if target_user:
+            pos = await self._get_user_position(target_user.id)
+            if pos:
+                dest = Position(pos.x + 0.5, pos.y, pos.z, pos.facing)
+                await self.highrise.teleport(user.id, dest)
+                await self.highrise.chat(f"⚡ @{user.username} warped to @{target_user.username}.")
+                return
+
+        await self.highrise.chat(f"Destination or user '{target_name}' not found.")
 
     async def cmd_bring(self, user: User, args: list) -> None:
         if not args:
@@ -408,9 +477,9 @@ class AdvanceHighriseBot(BaseBot):
             return
 
         target_username = args[0].lower().replace("@", "")
-        caller_pos = self.user_positions.get(user.id)
+        caller_pos = await self._get_user_position(user.id)
         if not caller_pos:
-            await self.highrise.chat("Could not detect your coordinates. Move slightly and retry.")
+            await self.highrise.chat("Could not detect your coordinates. Stand on the floor and try again.")
             return
 
         room_users = (await self.highrise.get_room_users()).content
@@ -450,18 +519,21 @@ class AdvanceHighriseBot(BaseBot):
             return
 
         spot_name = args[0].lower()
-        pos = self.user_positions.get(user.id)
+        pos = await self._get_user_position(user.id)
+
         if pos:
             self.saved_spots[spot_name] = pos
+            self._save_config()
             await self.highrise.chat(f"✅ Saved spot '{spot_name}' at ({pos.x:.1f}, {pos.y:.1f}, {pos.z:.1f}).")
         else:
-            await self.highrise.chat("Unable to get current position. Please move and try again.")
+            await self.highrise.chat("Unable to get coordinates. If you are sitting on furniture, stand up on the floor and try again.")
 
     async def cmd_del_spot(self, user: User, args: list) -> None:
         if not args or args[0].lower() not in self.saved_spots:
             await self.highrise.chat("Spot not found.")
             return
         del self.saved_spots[args[0].lower()]
+        self._save_config()
         await self.highrise.chat(f"🗑️ Deleted spot '{args[0].lower()}'.")
 
     async def cmd_list_spots(self) -> None:
@@ -478,7 +550,7 @@ class AdvanceHighriseBot(BaseBot):
             "🎵 MUSIC: !play <song/link> | !skip | !np | !q",
             "📍 TELEPORT: !tp <spot/@user> | !spots",
             "👑 ACCESS: !claimadmin <passphrase> | !admins",
-            "🛡️ ADMIN: !bot <tp/walk/come/coords> | !bring | !send | !setspot | !delspot | !addadmin | !deladmin | !volume"
+            "🛡️ ADMIN: !bot <tp/walk/come/coords/default> | !bring | !send | !setspot | !delspot | !addadmin | !deladmin | !volume"
         ]
         for line in bio_lines:
             await self.highrise.chat(line)
@@ -486,5 +558,5 @@ class AdvanceHighriseBot(BaseBot):
 
     async def cmd_help(self, user: User, is_admin: bool) -> None:
         general_commands = "!tp <spot/@user>, !spots, !admins, !play <song>, !skip, !np, !q, !bio"
-        admin_commands = " | Admin: !bot <tp/walk/come/coords>, !bring @user, !send @user <spot>, !setspot <name>, !delspot <name>, !addadmin @user, !deladmin @user, !volume <0-100>"
+        admin_commands = " | Admin: !bot <tp/walk/come/coords/default>, !bring @user, !send @user <spot>, !setspot <name>, !delspot <name>, !addadmin @user, !deladmin @user, !volume <0-100>"
         await self.highrise.chat(f"Commands: {general_commands}" + (admin_commands if is_admin else ""))
