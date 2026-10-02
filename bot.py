@@ -1,11 +1,13 @@
 import asyncio
 import json
 import os
+import sys
 import urllib.parse
 import urllib.request
 import yt_dlp
 from highrise import BaseBot, Position, User, AnchorPosition
 from highrise.models import SessionMetadata
+from highrise.__main__ import main, BotDefinition
 
 CONFIG_FILE = "bot_config.json"
 
@@ -16,7 +18,7 @@ class AdvanceHighriseBot(BaseBot):
         # 1. ACCESS CONTROL & ADMINS
         # ==========================
         self.super_admins = {"your_highrise_username".lower()}
-        self.admin_passphrase = "mySecretAdminPass123"
+        self.admin_passphrase = os.environ.get("ADMIN_PASSPHRASE", "mySecretAdminPass123")
 
         # Bot self-state
         self.bot_id = None
@@ -29,7 +31,7 @@ class AdvanceHighriseBot(BaseBot):
             "stage": Position(12.0, 1.5, 12.0, "FrontRight"),
             "bar": Position(3.0, 0.0, 4.0, "FrontLeft"),
             "jail": Position(0.0, 0.0, 0.0, "FrontRight"),
-            "bot": Position(18.0,1.0,14.5 , "FrontLeft")
+            "bot": Position(18.0, 1.0, 14.5, "FrontLeft")
         }
         self.user_positions = {}
 
@@ -108,8 +110,10 @@ class AdvanceHighriseBot(BaseBot):
             return self.user_positions[user_id]
 
         try:
-            room_users = (await self.highrise.get_room_users()).content
-            for u, pos in room_users:
+            response = await self.highrise.get_room_users()
+            room_users = response.content if hasattr(response, "content") else response
+            for item in room_users:
+                u, pos = item[0], item[1]
                 if u.id == user_id:
                     if isinstance(pos, Position):
                         self.user_positions[user_id] = pos
@@ -126,12 +130,13 @@ class AdvanceHighriseBot(BaseBot):
 
     async def on_start(self, session_metadata: SessionMetadata) -> None:
         self.bot_id = session_metadata.user_id
-        print(f"Bot connected to room: {session_metadata.room_info.room_name} (ID: {self.bot_id})")
+        room_name = session_metadata.room_info.room_name if session_metadata.room_info else "Highrise Room"
+        print(f"Bot connected to room: {room_name} (Bot ID: {self.bot_id})")
 
         if self.default_bot_spot in self.saved_spots:
             try:
                 await self.highrise.teleport(self.bot_id, self.saved_spots[self.default_bot_spot])
-                print(f"Bot spawned at initial spot: '{self.default_bot_spot}'")
+                print(f"Bot placed at initial spot: '{self.default_bot_spot}'")
             except Exception as e:
                 print(f"Failed to place bot on start: {e}")
 
@@ -255,17 +260,17 @@ class AdvanceHighriseBot(BaseBot):
         query = self.current_track["query"]
         await self.highrise.chat(f"🔍 Fetching track: '{query}'...")
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         try:
             real_title, duration = await loop.run_in_executor(None, self._fetch_track_info, query)
             self.current_track["title"] = real_title
             self.current_track["duration"] = duration
 
-            mins, secs = divmod(duration, 60)
+            mins, secs = divmod(duration or 180, 60)
             duration_str = f"{int(mins)}:{int(secs):02d}"
 
             await self.highrise.chat(f"🎶 Now Playing: '{real_title}' ({duration_str}) [Req by @{self.current_track['requested_by']}]")
-            self.playback_task = asyncio.create_task(self._track_timer(duration))
+            self.playback_task = asyncio.create_task(self._track_timer(duration or 180))
         except Exception as e:
             await self.highrise.chat(f"❌ Could not load '{query}': {e}")
             await self._play_next_track()
@@ -283,7 +288,7 @@ class AdvanceHighriseBot(BaseBot):
             return
 
         raw_query = " ".join(args).strip()
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         resolved_title = await loop.run_in_executor(None, self._resolve_spotify_or_query, raw_query)
 
         track_data = {
@@ -459,7 +464,8 @@ class AdvanceHighriseBot(BaseBot):
             await self.highrise.chat(f"⚡ @{user.username} warped to '{target_name}'.")
             return
 
-        room_users = (await self.highrise.get_room_users()).content
+        response = await self.highrise.get_room_users()
+        room_users = response.content if hasattr(response, "content") else response
         target_user = next((u for u, _ in room_users if u.username.lower() == target_name), None)
 
         if target_user:
@@ -483,7 +489,8 @@ class AdvanceHighriseBot(BaseBot):
             await self.highrise.chat("Could not detect your coordinates. Stand on the floor and try again.")
             return
 
-        room_users = (await self.highrise.get_room_users()).content
+        response = await self.highrise.get_room_users()
+        room_users = response.content if hasattr(response, "content") else response
         target_user = next((u for u, _ in room_users if u.username.lower() == target_username), None)
 
         if target_user:
@@ -505,7 +512,8 @@ class AdvanceHighriseBot(BaseBot):
             await self.highrise.chat(f"Spot '{spot_name}' does not exist. Use !spots.")
             return
 
-        room_users = (await self.highrise.get_room_users()).content
+        response = await self.highrise.get_room_users()
+        room_users = response.content if hasattr(response, "content") else response
         target_user = next((u for u, _ in room_users if u.username.lower() == target_username), None)
 
         if target_user:
@@ -561,3 +569,37 @@ class AdvanceHighriseBot(BaseBot):
         general_commands = "!tp <spot/@user>, !spots, !admins, !play <song>, !skip, !np, !q, !bio"
         admin_commands = " | Admin: !bot <tp/walk/come/coords/default>, !bring @user, !send @user <spot>, !setspot <name>, !delspot <name>, !addadmin @user, !deladmin @user, !volume <0-100>"
         await self.highrise.chat(f"Commands: {general_commands}" + (admin_commands if is_admin else ""))
+
+# ==========================
+# 24/7 AUTO-RECONNECT RUNNER
+# ==========================
+
+async def run_bot_loop():
+    room_id = os.environ.get("ROOM_ID")
+    api_token = os.environ.get("API_TOKEN")
+
+    # Command-line arguments fallback: python bot.py <room_id> <api_token>
+    if not room_id and len(sys.argv) > 1:
+        room_id = sys.argv[1]
+    if not api_token and len(sys.argv) > 2:
+        api_token = sys.argv[2]
+
+    if not room_id or not api_token:
+        print("ERROR: Missing ROOM_ID or API_TOKEN. Set them in environment variables or pass as CLI arguments.")
+        return
+
+    while True:
+        try:
+            print("Connecting to Highrise...")
+            definitions = [BotDefinition(AdvanceHighriseBot(), room_id, api_token)]
+            await main(definitions)
+        except Exception as e:
+            print(f"Room session closed or network dropped: {e}")
+            print("Waiting 10 seconds before attempting reconnection...")
+            await asyncio.sleep(10)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(run_bot_loop())
+    except KeyboardInterrupt:
+        print("Bot process stopped manually.")
