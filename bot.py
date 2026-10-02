@@ -1,5 +1,4 @@
 import asyncio
-
 from highrise import BaseBot, Position, User, AnchorPosition
 from highrise.models import SessionMetadata
 
@@ -9,6 +8,12 @@ class AdvanceHighriseBot(BaseBot):
         # 1. Access Control: Add Highrise user IDs or usernames here
         self.super_admins = ["YOUR_HIGHRISE_USERNAME"]
         
+        # Bot's internal ID (cached on start)
+        self.bot_id = None
+        
+        # Default spawn spot on connect
+        self.default_bot_spot = "dj"
+
         # 2. Predefined Teleportation Coordinates (x, y, z, facing)
         self.saved_spots = {
             "dj": Position(10.5, 0.0, 10.5, "FrontRight"),
@@ -34,7 +39,17 @@ class AdvanceHighriseBot(BaseBot):
     # ==========================
 
     async def on_start(self, session_metadata: SessionMetadata) -> None:
-        print(f"Bot connected to room: {session_metadata.room_info.room_name}")
+        self.bot_id = session_metadata.user_id
+        print(f"Bot connected to room: {session_metadata.room_info.room_name} (ID: {self.bot_id})")
+
+        # Auto-place bot at its default home spot on boot
+        if self.default_bot_spot in self.saved_spots:
+            try:
+                await self.highrise.teleport(self.bot_id, self.saved_spots[self.default_bot_spot])
+                print(f"Bot spawned at initial spot: '{self.default_bot_spot}'")
+            except Exception as e:
+                print(f"Failed to place bot on start: {e}")
+
         await self.highrise.chat("⚡ Highrise Advanced Controller Online. Type !help for commands.")
 
     async def on_user_join(self, user: User, position: Position | AnchorPosition) -> None:
@@ -80,6 +95,8 @@ class AdvanceHighriseBot(BaseBot):
             await self.cmd_del_spot(user, args)
         elif cmd == "!spots":
             await self.cmd_list_spots()
+        elif cmd == "!bot" and is_admin:
+            await self.cmd_bot_placement(user, args)
         elif cmd in ["!play", "!request"]:
             await self.cmd_request_song(user, args)
         elif cmd == "!skip":
@@ -92,7 +109,77 @@ class AdvanceHighriseBot(BaseBot):
             await self.cmd_set_volume(user, args)
 
     # ==========================
-    # TELEPORTATION FUNCTIONS
+    # BOT SELF-PLACEMENT SYSTEM
+    # ==========================
+
+    async def cmd_bot_placement(self, user: User, args: list) -> None:
+        """Admin only: Controls the bot's position and location."""
+        if not args:
+            await self.highrise.chat(f"@{user.username} Usage: !bot tp <spot> | !bot walk <spot> | !bot come | !bot coords <x> <y> <z> [facing]")
+            return
+
+        subcmd = args[0].lower()
+
+        # 1. Teleport bot to a spot
+        if subcmd == "tp":
+            if len(args) < 2:
+                await self.highrise.chat(f"@{user.username} Usage: !bot tp <spot_name>")
+                return
+            spot_name = args[1].lower()
+            if spot_name in self.saved_spots:
+                await self.highrise.teleport(self.bot_id, self.saved_spots[spot_name])
+                await self.highrise.chat(f"🤖 Bot teleported to '{spot_name}'.")
+            else:
+                await self.highrise.chat(f"Spot '{spot_name}' not found. Use !spots to view available locations.")
+
+        # 2. Walk bot to a spot
+        elif subcmd == "walk":
+            if len(args) < 2:
+                await self.highrise.chat(f"@{user.username} Usage: !bot walk <spot_name>")
+                return
+            spot_name = args[1].lower()
+            if spot_name in self.saved_spots:
+                await self.highrise.walk_to(self.saved_spots[spot_name])
+                await self.highrise.chat(f"🤖 Bot walking to '{spot_name}'...")
+            else:
+                await self.highrise.chat(f"Spot '{spot_name}' not found.")
+
+        # 3. Pull bot to the admin's current location
+        elif subcmd == "come":
+            admin_pos = self.user_positions.get(user.id)
+            if admin_pos:
+                dest = Position(admin_pos.x + 0.5, admin_pos.y, admin_pos.z, admin_pos.facing)
+                await self.highrise.teleport(self.bot_id, dest)
+                await self.highrise.chat(f"🤖 Bot moved to @{user.username}'s side.")
+            else:
+                await self.highrise.chat("Could not detect your position. Move slightly and retry.")
+
+        # 4. Teleport bot to exact numeric coordinates
+        elif subcmd in ["coords", "pos"]:
+            if len(args) < 4:
+                await self.highrise.chat(f"@{user.username} Usage: !bot coords <x> <y> <z> [facing]")
+                return
+            try:
+                x = float(args[1])
+                y = float(args[2])
+                z = float(args[3])
+                facing = args[4] if len(args) > 4 else "FrontRight"
+                dest = Position(x, y, z, facing)
+                await self.highrise.teleport(self.bot_id, dest)
+                await self.highrise.chat(f"🤖 Bot moved to ({x:.1f}, {y:.1f}, {z:.1f}).")
+            except ValueError:
+                await self.highrise.chat("Coordinates x, y, and z must be valid numbers.")
+
+        # 5. Set default respawn spot
+        elif subcmd == "default":
+            if len(args) < 2 or args[1].lower() not in self.saved_spots:
+                await self.highrise.chat("Usage: !bot default <saved_spot>")
+                return
+            self.default_bot_spot = args[1].lower()
+            await self.highrise.chat(f"✅ Bot startup spot set to '{self.default_bot_spot}'.")
+
+    # ==========================
+    # USER TELEPORTATION FUNCTIONS
     # ==========================
 
     async def cmd_teleport(self, user: User, args: list) -> None:
@@ -116,7 +203,6 @@ class AdvanceHighriseBot(BaseBot):
 
         if target_user and target_user.id in self.user_positions:
             pos = self.user_positions[target_user.id]
-            # Offset slightly so avatars do not clip into each other
             dest = Position(pos.x + 0.5, pos.y, pos.z, pos.facing)
             await self.highrise.teleport(user.id, dest)
             await self.highrise.chat(f"⚡ @{user.username} warped to @{target_user.username}.")
@@ -224,7 +310,6 @@ class AdvanceHighriseBot(BaseBot):
         self.is_playing = True
         self.skip_votes.clear()
         
-        # In an integrated setup, trigger your audio worker / media player API here
         await self.highrise.chat(f"🎶 Now Playing: '{self.current_track['title']}' [Req by @{self.current_track['requested_by']}]")
 
     async def cmd_skip_song(self, user: User, is_admin: bool) -> None:
@@ -234,7 +319,7 @@ class AdvanceHighriseBot(BaseBot):
             return
 
         if is_admin:
-            await self.highrise.chat(f"⏭️️ Admin @{user.username} forced skip.")
+            await self.highrise.chat(f"⏭ Admin @{user.username} forced skip.")
             await self._play_next_track()
             return
 
@@ -277,5 +362,5 @@ class AdvanceHighriseBot(BaseBot):
 
     async def cmd_help(self, user: User, is_admin: bool) -> None:
         general_commands = "!tp <spot/@user>, !spots, !play <song>, !skip, !np, !q"
-        admin_commands = " | Admin: !bring @user, !send @user <spot>, !setspot <name>, !delspot <name>, !volume <0-100>"
+        admin_commands = " | Admin: !bot <tp/walk/come/coords>, !bring @user, !send @user <spot>, !setspot <name>, !delspot <name>, !volume <0-100>"
         await self.highrise.chat(f"Commands: {general_commands}" + (admin_commands if is_admin else ""))
